@@ -13,9 +13,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry._logs import SeverityNumber
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -40,10 +43,13 @@ async def lifespan(app):
         raise RuntimeError("Set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT and OBSERVAGENT_API_KEY first")
     parsed = urlsplit(endpoint)
     logs_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+    metrics_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
     if not logs_endpoint:
         if not parsed.path.endswith('/v1/traces'):
             raise RuntimeError("Trace endpoint must end in /v1/traces, or set OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
         logs_endpoint = urlunsplit(parsed._replace(path=parsed.path[:-len('traces')] + 'logs'))
+    if not metrics_endpoint:
+        metrics_endpoint = urlunsplit(parsed._replace(path=parsed.path[:-len('traces')] + 'metrics'))
     resource = Resource.create({
         "service.name": "ollama-cli", "agent.id": "ollama-cli",
         "session.id": os.environ.get("OBSERVAGENT_SESSION_ID", str(uuid4())),
@@ -54,6 +60,16 @@ async def lifespan(app):
         endpoint=logs_endpoint, headers={"Authorization": f"Bearer {key}"}, timeout=10,
     ), schedule_delay_millis=1000))
     app.state.telemetry_logger = log_provider.get_logger("observagent.ollama-proxy")
+    metric_reader = PeriodicExportingMetricReader(OTLPMetricExporter(
+        endpoint=metrics_endpoint, headers={"Authorization": f"Bearer {key}"}, timeout=10,
+    ), export_interval_millis=5000)
+    metric_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
+    meter = metric_provider.get_meter("observagent.ollama-proxy")
+    app.state.telemetry_metrics = {
+        "requests": meter.create_counter("ollama.request.count", unit="{request}"),
+        "duration": meter.create_histogram("ollama.request.duration", unit="s"),
+        "tokens": meter.create_counter("ollama.token.count", unit="{token}"),
+    }
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(
         endpoint=endpoint, headers={"Authorization": f"Bearer {key}"}, timeout=10,
     ), schedule_delay_millis=1000))
@@ -65,6 +81,7 @@ async def lifespan(app):
         finally:
             await asyncio.to_thread(provider.shutdown)
             await asyncio.to_thread(log_provider.shutdown)
+            await asyncio.to_thread(metric_provider.shutdown)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -91,26 +108,38 @@ def record_usage(span, line):
             span.set_attribute(f"ollama.{name}_ms", data[name] / 1_000_000)
 
 
-def finish_request(span, logger, started):
+def finish_request(span, logger, started, metrics=None):
     """Emit one metadata-only request log, correlated with the existing trace."""
     attrs = dict(span.attributes)
     failed = span.status.status_code == StatusCode.ERROR
     complete = attrs.get("ollama.done", False)
     event = "ollama.request.failed" if failed else (
         "ollama.request.completed" if complete else "ollama.request.incomplete")
-    attrs.update({"event.name": event, "duration_ms": (time.monotonic() - started) * 1000})
+    elapsed = time.monotonic() - started
+    attrs.update({"event.name": event, "duration_ms": elapsed * 1000})
     for source, target in (("gen_ai.usage.input_tokens", "input_token_count"),
                            ("gen_ai.usage.output_tokens", "output_token_count")):
         if source in attrs:
             attrs[target] = attrs[source]
     try:
+        if metrics:
+            dimensions = {
+                "gen_ai.request.model": attrs.get("gen_ai.request.model", "unknown"),
+                "outcome": "failed" if failed else ("completed" if complete else "incomplete"),
+            }
+            context = set_span_in_context(span)
+            metrics["requests"].add(1, dimensions, context=context)
+            metrics["duration"].record(elapsed, dimensions, context=context)
+            for direction, name in (("input", "input_token_count"), ("output", "output_token_count")):
+                if name in attrs:
+                    metrics["tokens"].add(attrs[name], {**dimensions, "token.type": direction}, context=context)
         logger.emit(
             timestamp=time.time_ns(), context=set_span_in_context(span),
             severity_number=SeverityNumber.ERROR if failed else SeverityNumber.INFO,
             severity_text="ERROR" if failed else "INFO",
             body=event, attributes=attrs,
         )
-        log.info("%s: input=%s output=%s; trace and log queued for export",
+        log.info("%s: input=%s output=%s; logs, metrics and trace queued for export",
                  event, attrs.get("input_token_count"), attrs.get("output_token_count"))
     except Exception:
         log.exception("Could not queue Ollama request log")
@@ -141,7 +170,8 @@ async def proxy(path: str, request: Request):
     except BaseException as exc:
         if span:
             span.set_status(StatusCode.ERROR, type(exc).__name__)
-            finish_request(span, request.app.state.telemetry_logger, started)
+            finish_request(span, request.app.state.telemetry_logger, started,
+                           request.app.state.telemetry_metrics)
         if isinstance(exc, httpx.HTTPError):
             return JSONResponse({"error": "Cannot reach Ollama on 127.0.0.1:11434"}, status_code=502)
         raise
@@ -173,7 +203,8 @@ async def proxy(path: str, request: Request):
             raise
         finally:
             if span:
-                finish_request(span, request.app.state.telemetry_logger, started)
+                finish_request(span, request.app.state.telemetry_logger, started,
+                               request.app.state.telemetry_metrics)
             await upstream.aclose()
 
     return StreamingResponse(stream(), status_code=upstream.status_code,

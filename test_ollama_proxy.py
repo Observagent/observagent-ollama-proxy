@@ -10,6 +10,8 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import SimpleLogRecordProcessor, InMemoryLogRecordExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from ollama_proxy import app, lifespan, finish_request
 from opentelemetry.trace import StatusCode
@@ -33,13 +35,18 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://example.test/v1/traces",
             "OBSERVAGENT_API_KEY": "test-key",
             "OBSERVAGENT_SESSION_ID": "test-session",
-        }, clear=True), patch("ollama_proxy.OTLPSpanExporter") as traces, patch("ollama_proxy.OTLPLogExporter") as logs:
+        }, clear=True), patch("ollama_proxy.OTLPSpanExporter") as traces, \
+                patch("ollama_proxy.OTLPLogExporter") as logs, \
+                patch("ollama_proxy.OTLPMetricExporter") as metrics:
             async with lifespan(app):
                 logs.assert_called_once_with(endpoint="https://example.test/v1/logs",
+                    headers={"Authorization": "Bearer test-key"}, timeout=10)
+                metrics.assert_called_once_with(endpoint="https://example.test/v1/metrics",
                     headers={"Authorization": "Bearer test-key"}, timeout=10)
                 self.assertEqual(app.state.telemetry_logger.resource.attributes["session.id"], "test-session")
             logs.return_value.shutdown.assert_called_once()
             traces.return_value.shutdown.assert_called_once()
+            metrics.return_value.shutdown.assert_called_once()
 
     async def test_failed_request_log(self):
         provider = TracerProvider()
@@ -65,6 +72,14 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         log_provider = LoggerProvider()
         log_provider.add_log_record_processor(SimpleLogRecordProcessor(logs))
         app.state.telemetry_logger = log_provider.get_logger("test")
+        metric_reader = InMemoryMetricReader()
+        metric_provider = MeterProvider(metric_readers=[metric_reader])
+        meter = metric_provider.get_meter("test")
+        app.state.telemetry_metrics = {
+            "requests": meter.create_counter("ollama.request.count", unit="{request}"),
+            "duration": meter.create_histogram("ollama.request.duration", unit="s"),
+            "tokens": meter.create_counter("ollama.token.count", unit="{token}"),
+        }
 
         def upstream(request):
             self.assertEqual(request.url.host, "127.0.0.1")
@@ -97,8 +112,16 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.attributes["gen_ai.request.model"], "test-model")
         self.assertEqual(record.trace_id, spans[0].context.trace_id)
         self.assertNotIn("hello", str(record.attributes))
+        metric_data = metric_reader.get_metrics_data()
+        metrics = {m.name: m for rm in metric_data.resource_metrics
+                   for sm in rm.scope_metrics for m in sm.metrics}
+        self.assertEqual(metrics["ollama.request.count"].data.data_points[0].value, 1)
+        self.assertEqual(metrics["ollama.request.duration"].data.data_points[0].count, 1)
+        self.assertEqual(sorted(point.value for point in
+            metrics["ollama.token.count"].data.data_points), [3, 7])
         log_provider.shutdown()
         provider.shutdown()
+        metric_provider.shutdown()
 
 
 if __name__ == "__main__":

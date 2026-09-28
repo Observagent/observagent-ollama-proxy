@@ -8,6 +8,7 @@ from uuid import uuid4
 import requests
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
 
 
 def main():
@@ -23,7 +24,9 @@ def main():
         parser.error('Trace endpoint must end in /v1/traces')
     logs_endpoint = os.environ.get('OTEL_EXPORTER_OTLP_LOGS_ENDPOINT') or urlunsplit(
         parsed._replace(path=parsed.path[:-len('traces')] + 'logs'))
-    traces, logs = ExportTraceServiceRequest(), ExportLogsServiceRequest()
+    metrics_endpoint = os.environ.get('OTEL_EXPORTER_OTLP_METRICS_ENDPOINT') or urlunsplit(
+        parsed._replace(path=parsed.path[:-len('traces')] + 'metrics'))
+    traces, logs, metrics = ExportTraceServiceRequest(), ExportLogsServiceRequest(), ExportMetricsServiceRequest()
     if not args.empty:
         trace_resource = traces.resource_spans.add()
         log_resource = logs.resource_logs.add()
@@ -45,8 +48,20 @@ def main():
         record.body.string_value = 'Synthetic Ollama delivery check'
         attr = record.attributes.add()
         attr.key, attr.value.string_value = 'event.name', 'ollama.delivery-test'
+        metric_resource = metrics.resource_metrics.add()
+        for name, value in {'service.name': 'ollama-cli', 'agent.id': 'ollama-cli',
+                            'session.id': 'ollama-delivery-test'}.items():
+            attr = metric_resource.resource.attributes.add()
+            attr.key = name
+            attr.value.string_value = value
+        metric = metric_resource.scope_metrics.add().metrics.add()
+        metric.name = 'ollama.delivery.test'
+        point = metric.sum.data_points.add()
+        point.as_int = 1
+        point.time_unix_nano = time.time_ns()
     failed = False
-    for signal, url, batch in [('traces', endpoint, traces), ('logs', logs_endpoint, logs)]:
+    for signal, url, batch in [('traces', endpoint, traces), ('logs', logs_endpoint, logs),
+                               ('metrics', metrics_endpoint, metrics)]:
         try:
             response = requests.post(url, headers={'Authorization': f'Bearer {key}',
                 'Content-Type': 'application/x-protobuf'}, data=batch.SerializeToString(),
